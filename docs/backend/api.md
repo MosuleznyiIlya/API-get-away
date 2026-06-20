@@ -4,7 +4,9 @@
 
 ### Base URL
 
+```
 /api/v1
+```
 
 ### Content Type
 
@@ -14,7 +16,7 @@ Content-Type: application/json
 
 ### Authentication
 
-Все endpoints требуют JWT аутентификацию.
+Все endpoints требуют JWT аутентификацию (Admin API).
 
 ```http
 Authorization: Bearer <jwt_token>
@@ -24,29 +26,23 @@ Authorization: Bearer <jwt_token>
 
 ## API Versioning
 
-Текущая версия:
-
-```text
-v1
-```
+Текущая версия: `v1`
 
 Пример:
-
-```text
+```
 /api/v1/services
 /api/v1/routes
 /api/v1/api-keys
 ```
 
 Правила:
-
-- новые поля могут добавляться без изменения версии
-- breaking changes требуют новой версии API
+- Новые поля могут добавляться без изменения версии
+- Breaking changes требуют новой версии API
 - v2 будет опубликована отдельным namespace
 
 ---
 
-# Error Response Format
+## Error Response Format
 
 Все ошибки возвращаются в едином формате.
 
@@ -63,27 +59,25 @@ v1
 
 ---
 
-# Pagination
+## Pagination
 
 Для всех коллекций используется Offset Pagination.
 
-## Request
+### Request
 
 ```text
 ?page=1&page_size=50
 ```
 
-## Rules
+### Rules
 
 ```text
 page >= 1
-
 page_size >= 1
-
 page_size <= 100
 ```
 
-## Response
+### Response
 
 ```json
 {
@@ -140,9 +134,7 @@ Paginated Service List
 ### Error Codes
 
 ```text
-401
-403
-500
+401, 403, 500
 ```
 
 ---
@@ -166,18 +158,15 @@ Paginated Service List
 ### Validation
 
 ```text
-name unique
-slug unique
-base_url valid URL
+name: unique
+slug: unique
+base_url: valid URL
 ```
 
 ### Error Codes
 
 ```text
-400
-401
-409
-500
+400, 401, 409, 500
 ```
 
 ---
@@ -189,9 +178,7 @@ base_url valid URL
 ### Error Codes
 
 ```text
-401
-404
-500
+401, 404, 500
 ```
 
 ---
@@ -203,11 +190,7 @@ base_url valid URL
 ### Error Codes
 
 ```text
-400
-401
-404
-409
-500
+400, 401, 404, 409, 500
 ```
 
 ---
@@ -289,11 +272,8 @@ Paginated Route List
 
 ```text
 service exists
-
 valid HTTP method
-
 cache_ttl_seconds >= 0
-
 priority >= 0
 ```
 
@@ -382,28 +362,23 @@ priority >= 0
 ### Validation
 
 ```text
-name required
-
-rate_limit_per_minute > 0
+name: required
+rate_limit_per_minute: > 0
 ```
 
 ---
 
 ## GET /api/v1/api-keys/{id}
 
-Получить API Key.
-
 ---
 
 ## PATCH /api/v1/api-keys/{id}
-
-Обновить API Key.
 
 ---
 
 ## DELETE /api/v1/api-keys/{id}
 
-Деактивировать API Key.
+Деактивировать API Key (Soft Delete).
 
 ### Response
 
@@ -445,19 +420,12 @@ Request Logs являются read-only.
 
 ```text
 ?service_id=uuid
-
 ?route_id=uuid
-
 ?api_key_id=uuid
-
 ?method=GET
-
 ?status_code=200
-
 ?cache_hit=true
-
 ?created_from=2026-01-01
-
 ?created_to=2026-01-31
 ```
 
@@ -475,126 +443,13 @@ Request Logs являются read-only.
 
 ---
 
-# Dashboard API
-
-## GET /api/v1/dashboard/metrics
-
-### Response
-
-```json
-{
-  "total_requests": 100000,
-  "success_rate": 99.8,
-  "error_rate": 0.2,
-  "cache_hit_rate": 85.4,
-  "average_latency_ms": 34
-}
-```
-
----
-
-## GET /api/v1/dashboard/metrics/timeseries
-
-### Query Parameters
-
-```text
-?period=1h
-
-?period=24h
-
-?period=7d
-```
-
-### Response
-
-```json
-{
-  "points": [
-    {
-      "timestamp": "2026-01-01T10:00:00Z",
-      "requests": 1200,
-      "errors": 5,
-      "avg_latency_ms": 42
-    }
-  ]
-}
-```
-
----
-
-# Gateway Headers
-
-## Rate Limiting Headers
-
-Возвращаются Gateway Runtime.
-
-```http
-X-RateLimit-Limit: 100
-
-X-RateLimit-Remaining: 76
-
-X-RateLimit-Reset: 1710000120
-```
-
----
-
-## Cache Headers
-
-### Cache Hit
-
-```http
-X-Cache: HIT
-```
-
-### Cache Miss
-
-```http
-X-Cache: MISS
-```
-
-### Cache TTL
-
-```http
-Cache-Control: max-age=60
-```
-
----
-
-## Tracing Headers
-
-### Request ID
-
-```http
-X-Request-ID: uuid
-```
-
-### Correlation ID
-
-```http
-X-Correlation-ID: uuid
-```
-
-### Forwarded Headers
-
-```http
-X-Forwarded-For
-X-Forwarded-Host
-X-Forwarded-Proto
-```
-
----
-
 # Global Validation Rules
 
 ```text
 UUID → UUID v4
-
 Timestamp → ISO 8601
-
 URL → valid HTTP/HTTPS URL
-
 page >= 1
-
 page_size <= 100
 ```
 
@@ -603,7 +458,7 @@ page_size <= 100
 # Standard Error Codes
 
 | Code | Description |
-|--------|--------|
+|------|-------------|
 | 400 | Validation Error |
 | 401 | Unauthorized |
 | 403 | Forbidden |
@@ -619,34 +474,12 @@ page_size <= 100
 
 # API Design Decisions
 
-### APD-001
-
-URL Versioning через `/api/v1`.
-
-### APD-002
-
-Единый формат ошибок для всех модулей.
-
-### APD-003
-
-Все коллекции поддерживают pagination.
-
-### APD-004
-
-Все коллекции поддерживают filtering и sorting.
-
-### APD-005
-
-API Key показывается полностью только при создании.
-
-### APD-006
-
-Request Logs являются append-only и read-only.
-
-### APD-007
-
-Все ответы содержат `X-Request-ID`.
-
-### APD-008
-
-Rate Limit и Cache состояние передаются через HTTP headers.
+| ID | Decision |
+|----|----------|
+| APD-001 | URL Versioning через `/api/v1` |
+| APD-002 | Единый формат ошибок для всех модулей |
+| APD-003 | Все коллекции поддерживают pagination |
+| APD-004 | Все коллекции поддерживают filtering и sorting |
+| APD-005 | API Key показывается полностью только при создании |
+| APD-006 | Request Logs являются append-only и read-only |
+| APD-007 | Все ответы содержат `X-Request-ID` |

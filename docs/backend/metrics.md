@@ -1,90 +1,129 @@
 # Metrics
 
-## Metrics Model
+## Counters
 
-### Request Metrics
+### Request Counters
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `gateway_requests_total` | Counter | service, route, method, status | Общее количество запросов |
-| `gateway_request_duration_ms` | Histogram | service, route | Время обработки запроса |
-| `gateway_request_size_bytes` | Histogram | service | Размер входящего запроса |
-| `gateway_response_size_bytes` | Histogram | service | Размер ответа |
+| Counter | Redis Key | Description |
+|---------|-----------|-------------|
+| Total Requests | `metrics:requests:minute:{timestamp}` | Запросы в минуту |
+| Errors | `metrics:errors:minute:{timestamp}` | Ошибки в минуту |
+| Cache Hits | `metrics:cache_hit:minute:{timestamp}` | Cache HIT в минуту |
+| Cache Misses | `metrics:cache_miss:minute:{timestamp}` | Cache MISS в минуту |
+| Rate Limit Hits | `metrics:rate_limit:minute:{timestamp}` | 429 ответы в минуту |
 
-### Cache Metrics
+### Latency Aggregation
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `gateway_cache_hits_total` | Counter | route | Количество cache hits |
-| `gateway_cache_misses_total` | Counter | route | Количество cache misses |
-| `gateway_cache_size_bytes` | Gauge | route | Размер кэша |
+Redis Keys:
+- `metrics:latency_sum:minute:{timestamp}` — сумма latency
+- `metrics:latency_count:minute:{timestamp}` — количество запросов
 
-### Rate Limit Metrics
+Average latency вычисляется:
+```
+avg_latency = latency_sum / latency_count
+```
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `gateway_rate_limit_hits_total` | Counter | route, client | Количество срабатываний rate limit |
-| `gateway_rate_limit_allowed_total` | Counter | route, client | Количество разрешенных запросов |
+### Example
 
-### Error Metrics
+```
+metrics:latency_sum:minute:202606201830 = 85000
+metrics:latency_count:minute:202606201830 = 2000
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `gateway_errors_total` | Counter | service, error_type | Количество ошибок |
-| `gateway_upstream_errors_total` | Counter | service, error_type | Ошибки upstream |
+avg_latency = 85000 / 2000 = 42.5ms
+```
 
-## Aggregation
+## Latency Tracking
 
-### Real-time Aggregation
+### Histogram Buckets
 
-Агрегация в течение 1 минутного окна:
-- SUM(requests_total)
-- AVG(request_duration_ms)
-- PERCENTILE(request_duration_ms, 95)
-- SUM(errors_total) / SUM(requests_total) = error_rate
+| Bucket | Range |
+|--------|-------|
+| lt_10ms | < 10ms |
+| lt_50ms | < 50ms |
+| lt_100ms | < 100ms |
+| lt_200ms | < 200ms |
+| lt_500ms | < 500ms |
+| lt_1000ms | < 1000ms |
+| gt_1000ms | > 1000ms |
+
+### Percentiles
+
+- p50 — медиана
+- p95 — 95-й перцентиль
+- p99 — 99-й перцентиль
+
+## Cache Hit Rate
+
+```
+cache_hit_rate = cache_hits / (cache_hits + cache_misses)
+```
+
+## Rate Limit Hits
+
+- Counter: `metrics:rate_limit:minute:{timestamp}`
+- Alert threshold: > 100/min для одного клиента
+
+## Redis Aggregation Model
+
+### Per-Minute Aggregation
+
+- Ключи хранятся с TTL = 24 часа (для Dashboard MVP)
+- Production: TTL = 7 дней
+- Ежечасная агрегация в PostgreSQL:
+  - Таблица: `metrics_aggregated`
+  - Поля: `hour`, `service_id`, `total_requests`, `avg_latency`, `error_rate`, `cache_hit_rate`
 
 ### Historical Aggregation
 
-Ежечасная агрегация:
-- Сохранение в таблицу `metrics_aggregated`
-- Поля: hour, service_id, total_requests, avg_latency, error_rate
-
-## Dashboard Metrics
-
-### Key Metrics for Dashboard
-
-1. **Total Requests (Last 24h)**
-   - Query: SUM(requests_total) WHERE timestamp > NOW() - 24h
-
-2. **Average Latency (Last 1h)**
-   - Query: AVG(request_duration_ms) WHERE timestamp > NOW() - 1h
-
-3. **Error Rate (Last 1h)**
-   - Query: SUM(errors_total) / SUM(requests_total) WHERE timestamp > NOW() - 1h
-
-4. **Top 5 Slowest Routes**
-   - Query: AVG(request_duration_ms) GROUP BY route ORDER BY avg DESC LIMIT 5
-
-5. **Cache Hit Ratio**
-   - Query: SUM(cache_hits) / (SUM(cache_hits) + SUM(cache_misses))
-
-6. **Rate Limit Events**
-   - Query: SUM(rate_limit_hits) WHERE timestamp > NOW() - 1h
-
-### API Endpoints
-
+```sql
+-- Ежечасная агрегация
+INSERT INTO metrics_aggregated (hour, service_id, total_requests, avg_latency, error_rate)
+SELECT 
+  date_trunc('hour', timestamp) as hour,
+  service_id,
+  SUM(requests_total) as total_requests,
+  AVG(request_duration_ms) as avg_latency,
+  SUM(errors_total)::float / NULLIF(SUM(requests_total), 0) as error_rate
+FROM metrics
+WHERE timestamp > NOW() - INTERVAL '1 day'
+GROUP BY hour, service_id;
 ```
-GET /api/v1/metrics/dashboard
+
+## Dashboard API
+
+### GET /api/v1/dashboard/metrics
+
 Response:
+```json
 {
-  "total_requests_24h": 150000,
-  "avg_latency_1h_ms": 45.2,
-  "error_rate_1h": 0.01,
-  "cache_hit_ratio": 0.75,
-  "top_slowest_routes": [
-    {"route": "/api/v1/orders", "avg_latency_ms": 120.5}
-  ],
-  "rate_limit_events_1h": 45
+  "total_requests": 100000,
+  "success_rate": 99.8,
+  "error_rate": 0.2,
+  "cache_hit_rate": 85.4,
+  "average_latency_ms": 34
+}
+```
+
+### GET /api/v1/dashboard/metrics/timeseries
+
+Query Parameters:
+```text
+?period=1h
+?period=24h
+?period=7d
+```
+
+Response:
+```json
+{
+  "points": [
+    {
+      "timestamp": "2026-01-01T10:00:00Z",
+      "requests": 1200,
+      "errors": 5,
+      "avg_latency_ms": 42
+    }
+  ]
 }
 ```
 
@@ -108,3 +147,11 @@ Response:
 | Latency p95 | > 500ms | > 1000ms |
 | Upstream Errors | > 10/min | > 50/min |
 | Redis Latency | > 10ms | > 50ms |
+
+## Redis Fallback Behavior
+
+Если Redis недоступен:
+- Метрики не агрегируются в real-time
+- Логируется warning: `metrics_redis_unavailable`
+- Gateway продолжает работу (fail-open)
+- Метрики записываются напрямую в PostgreSQL (sync fallback, снижает throughput)

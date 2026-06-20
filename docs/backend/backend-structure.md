@@ -54,19 +54,22 @@ gateway/
 
 ## Django Apps
 
-- **services** — CRUD upstream-сервисов
-- **routes** — CRUD маршрутов проксирования
-- **auth** — JWT и API Key валидация
-- **ratelimit** — алгоритмы ограничения частоты
-- **cache** — стратегии кэширования
-- **proxy** — HTTP клиент для upstream
-- **logs** — структурированное логирование
-- **metrics** — сбор и агрегация метрик
-- **dashboard** — API для админ-панели
+| App | Responsibility | Allowed | Forbidden |
+|-----|---------------|---------|-----------|
+| **services** | Service Registry | CRUD Services | Routing, Cache, JWT, Rate Limiting |
+| **routes** | Route Configuration | Route CRUD, Route Resolution Rules | Proxy Execution |
+| **api_keys** | API Key Management | Generate, Rotate, Revoke, Validate Metadata | Rate Limiting logic |
+| **auth** | Authentication | JWT Validation, API Key Validation | Cache, Proxy, Metrics |
+| **ratelimit** | Traffic Control | Token Bucket algorithms | Business logic |
+| **cache** | Response Cache | Cache strategies, invalidation | Upstream communication |
+| **proxy** | Reverse Proxy | HTTP client, header forwarding, timeouts | Route resolution |
+| **logs** | Structured Logging | JSON logs, async write, retention | Log analysis |
+| **metrics** | Metrics Collection | Counters, latency, aggregation | Dashboard rendering |
+| **dashboard** | Admin Dashboard API | Read-only metrics aggregation | Direct DB queries |
 
 ## Module Boundaries
 
-Каждый app имеет четкие границы:
+Каждый app имеет чёткие границы:
 - Модели только внутри своего app
 - Сервисный слой для бизнес-логики
 - Views только для HTTP адаптации

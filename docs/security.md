@@ -1,648 +1,209 @@
-# Security Architecture Overview
+# Security
 
-The API Gateway is the first line of defense for all downstream services.
+## 1. Auth Layer Overview
 
-The primary tasks of the security layer:
-
-- Authenticate
-- Authorize
-- Validate
-- Protect
-- Observe
-
-All incoming requests pass through the Security Pipeline before reaching the Proxy Layer.
-
-## Security Pipeline
-
+Порядок middleware (единый pipeline):
 ```
-Request
-  ↓
-Request ID
-  ↓
-Header Validation
-  ↓
-JWT Validation
-  ↓
-API Key Validation
-  ↓
-Replay Protection
-  ↓
-Rate Limiting
-  ↓
-Route Resolution
-  ↓
-Proxy
-  ↓
-Logging
-  ↓
-Response
+Request → WAF/IP Allowlist → API Key Auth → JWT Validation → Rate Limit → Route Match → Proxy → Upstream
 ```
+
+## 2. API Key Authentication
+
+### 2.1 Generation Format
+
+API Key генерируется в формате: `{prefix}_{random_base62}`
+
+- **Prefix**: `ag_` (gateway)
+- **Random**: 32 символа из `[a-zA-Z0-9]`
+- **Пример**: `ag_abc123def456ghi789jkl012mno345pq`
+
+Полный ключ показывается только при создании (one-time display).
+
+### 2.2 Hashing & Storage
+
+- Алгоритм: **bcrypt** с cost factor 12
+- Хранится в БД: `bcrypt_hash(key)`
+- Префикс хранится открытым текстом для идентификации
+- Полный ключ никогда не логируется
+
+```sql
+CREATE TABLE api_keys (
+    id UUID PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    key_hash VARCHAR(255) NOT NULL,
+    prefix VARCHAR(10) NOT NULL UNIQUE,
+    is_active BOOLEAN DEFAULT TRUE,
+    rate_limit INTEGER DEFAULT 1000,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+### 2.3 Validation Flow
+
+1. Извлечь `X-API-Key` из заголовка
+2. Извлечь prefix (часть до `_`)
+3. Найти запись в БД по `prefix` (быстрый lookup)
+4. Сравнить `bcrypt` предоставленного ключа с `key_hash` (constant-time comparison)
+5. Проверить `is_active = TRUE`
+6. Привязать `api_key_id` к контексту запроса
+7. Если невалиден — вернуть 401 Unauthorized
+
+### 2.4 Revocation & Rotation
+
+**Soft Delete (default):**
+1. Установить `is_active = FALSE`
+2. Ключ остаётся в БД для аудита
+3. Все запросы с этим ключом отклоняются
+4. Инвалидировать связанный кэш в Redis
+
+**Hard Delete (future):**
+1. Удалить запись из БД
+2. Очистить связанные логи (анонимизировать `api_key_id`)
+3. Инвалидировать кэш
+
+**Rotation Flow:**
+1. Создать новый ключ
+2. Обновить конфигурацию клиента
+3. Отозвать старый ключ (soft delete)
+4. Grace period: 24 часа для миграции
+
+### 2.5 Risks
+
+- **Timing attacks** → использовать `bcrypt` с постоянным временем сравнения
+- **Key enumeration** → префикс уникален, но не даёт инфо о полном ключе
+- **Хранение в логах** → никогда не логировать полный ключ, только `prefix`
+- **Key leakage** → one-time display при создании, нет возможности восстановить
 
 ---
 
-## 1. Threat Model (STRIDE)
+## 3. JWT Validation
 
-### S — Spoofing Identity
+### 3.1 Supported Algorithms
 
-**Risks**
+| Algorithm | Type | Status |
+|-----------|------|--------|
+| HS256 | HMAC with SHA-256 | Default |
+| HS384 | HMAC with SHA-384 | Supported |
+| HS512 | HMAC with SHA-512 | Supported |
+| RS256 | RSA with SHA-256 | Future |
 
-Client impersonation.
+### 3.2 Validation Rules
 
-**Examples:**
+**1. Format Validation:**
+- Токен должен состоять из 3 частей, разделённых точками: `header.payload.signature`
+- Каждая часть — Base64Url encoded
 
-- Fake JWT
-- Stolen API Key
-- Fake X-Forwarded-* headers
+**2. Header Validation:**
+- `alg` — должен быть в списке supported algorithms (жёстко зафиксирован в конфиге, не доверять header)
+- `typ` — должен быть `"JWT"`
 
-**Protection**
+**3. Payload Validation:**
+- `exp` (Expiration) — токен не должен быть просрочен
+- `iat` (Issued At) — должен быть в прошлом
+- `iss` (Issuer) — должен совпадать с configured issuer
+- `sub` (Subject) — обязательное поле, идентификатор пользователя
+- `aud` — должен совпадать с `service_id` (если указан)
+- Clock skew допуск: ±60 секунд
 
-- JWT Signature Validation
-- API Key Hash Verification
-- Trusted Proxy Configuration
-- Request Identity Tracking
+**4. Signature Validation:**
+- Для HS256: `HMACSHA256(base64url(header) + "." + base64url(payload), secret_key)`
+- Секретный ключ хранится в environment variable `JWT_SECRET_KEY`
 
-### T — Tampering
+**5. Custom Claims (Future):**
+- `roles` — массив ролей для RBAC
+- `permissions` — массив разрешений
 
-**Risks**
+### 3.3 Token Rules
 
-Modification of request content.
+- Access token TTL: **15 минут**
+- Refresh token TTL: **7 дней** (хранится отдельно, не в Gateway)
+- Нет blacklisting на уровне Gateway — это задача Identity Provider
+- Алгоритм `alg` жёстко зафиксирован в конфигурации (защита от algorithm confusion)
 
-**Examples:**
+### 3.4 Error Responses
 
-- Header Manipulation
-- JWT Payload Modification
-- Request Rewriting
-
-**Protection**
-
-- JWT Signature Verification
-- Header Validation
-- Strict Route Matching
-
-### R — Repudiation
-
-**Risks**
-
-User denies performing actions.
-
-**Protection**
-
-- Request ID
-- Audit Logs
-- Immutable Request Logs
-- Timestamp Tracking
-
-### I — Information Disclosure
-
-**Risks**
-
-Data leakage.
-
-**Examples:**
-
-- JWT Leakage
-- API Key Leakage
-- Internal Headers Exposure
-- Stack Traces
-
-**Protection**
-
-- Secrets Redaction
-- Structured Logging
-- Sanitized Error Responses
-- Header Filtering
-
-### D — Denial of Service
-
-**Risks**
-
-Gateway overload.
-
-**Examples:**
-
-- Request Flooding
-- Credential Stuffing
-- Cache Exhaustion
-- Large Payload Abuse
-
-**Protection**
-
-- Rate Limiting
-- Body Size Limits
-- Connection Limits
-- Redis-backed Counters
-
-### E — Elevation of Privilege
-
-**Risks**
-
-Gaining access above the authorized level.
-
-**Protection**
-
-- JWT Claim Validation
-- Role Validation
-- Scope Validation
-- Route-Level Authorization
-
----
-
-## 2. JWT Validation Flow (Detailed)
-
-### Supported Algorithms
-
-**MVP:**
-
-- RS256
-- ES256
-
-**Not supported:**
-
-- `none`
-
-### Validation Flow
-
-```
-Authorization Header
-  ↓
-Extract Token
-  ↓
-Decode Header
-  ↓
-Validate Algorithm
-  ↓
-Validate Signature
-  ↓
-Validate Issuer
-  ↓
-Validate Audience
-  ↓
-Validate Expiration
-  ↓
-Validate Not Before
-  ↓
-Validate Claims
-  ↓
-Authenticated
-```
-
-### Required Claims
-
+**Invalid Token Format:**
 ```json
 {
-  "sub": "...",
-  "iss": "...",
-  "aud": "...",
-  "exp": "...",
-  "iat": "..."
+  "error": "invalid_token_format",
+  "message": "Token must consist of 3 parts separated by dots"
 }
 ```
+Status: 401 Unauthorized
 
-### Optional Claims
-
+**Token Expired:**
 ```json
 {
-  "roles": [],
-  "permissions": [],
-  "scope": []
+  "error": "token_expired",
+  "message": "Token has expired",
+  "exp": 1704067200
 }
 ```
+Status: 401 Unauthorized
 
-### Validation Rules
-
-| Claim | Rule |
-|-------|------|
-| `exp` | Current Time < exp |
-| `nbf` | Current Time >= nbf |
-| `iat` | Cannot be too far in the future. Maximum: +5 minutes |
-| `aud` | Must match Gateway Audience |
-| `iss` | Must be in the list of trusted Issuers |
-
-### Failure Responses
-
-- INVALID_TOKEN
-- TOKEN_EXPIRED
-- INVALID_SIGNATURE
-- INVALID_AUDIENCE
-- INVALID_ISSUER
-
-**HTTP:** 401
-
----
-
-## 3. API Key Security Model
-
-### Storage Model
-
-Never store API Keys in plain text.
-
-### Lifecycle
-
+**Invalid Signature:**
+```json
+{
+  "error": "invalid_signature",
+  "message": "Token signature is invalid"
+}
 ```
-Generate
-  ↓
-Display Once
-  ↓
-Hash
-  ↓
-Store Hash
-  ↓
-Validate Hash
+Status: 401 Unauthorized
+
+**Invalid Algorithm:**
+```json
+{
+  "error": "invalid_algorithm",
+  "message": "Algorithm not supported"
+}
 ```
+Status: 401 Unauthorized
 
-### Database Storage
+### 3.5 Risks
 
-**Store:**
-
-- `key_hash`
-- `key_prefix`
-
-**Do not store:**
-
-- `full_api_key`
-
-### Key Format
-
-Example:
-
-```
-agw_live_xxxxxxxxxxxxxxxxxxxxx
-```
-
-### Rotation
-
-**Supported:**
-
-- Create New Key
-- Deactivate Old Key
-
-### Revocation
-
-After deletion:
-
-- DB revoke
-- Redis invalidate
-- Immediate rejection
+- **Token leakage** → маскировать `Authorization` в логах (`Authorization: Bearer ****`)
+- **Algorithm confusion** → жёстко зафиксировать `alg` в конфиге, не доверять `alg` из header
+- **Clock skew** → допуск ±60 секунд
+- **Replay attacks** → mitigated коротким TTL (15 min)
 
 ---
 
-## 4. Signature Validation (Optional)
+## 4. Middleware Order & Failures
 
-Not required for MVP.
-
-For Enterprise version, the following may be supported:
-
-- HMAC Signatures
-
-Example:
-
-- `X-Signature`
-- `X-Timestamp`
-
-Flow:
-
-```
-Request
-  ↓
-Canonical Payload
-  ↓
-HMAC Verification
-  ↓
-Accept / Reject
-```
-
-**Application:**
-
-- Webhooks
-- Machine-to-Machine APIs
+| Порядок | Слой | Fail-Closed? | Описание |
+|---------|------|--------------|----------|
+| 1 | WAF / IP Allowlist | Да | Блокировка по IP/гео |
+| 2 | API Key | Да | 401 при невалидном ключе |
+| 3 | JWT | Да | 401 при невалидном токене |
+| 4 | Rate Limit | Нет | Fail-open с алертом при недоступности Redis |
+| 5 | Routing | Да | 404 при отсутствии маршрута |
+| 6 | Proxy | Да | 502/504 при проблемах upstream |
 
 ---
 
-## 5. Rate Limit Abuse Prevention
+## 5. SSRF Protection
 
-### Primary Defense
-
-Redis Token Bucket.
-
-### Threats
-
-| Threat | Description |
-|--------|-------------|
-| Flooding | 10,000 req/sec |
-| Distributed Abuse | Multiple Clients |
-| Credential Stuffing | Many API Keys |
-
-### Mitigation
-
-| Measure | Limit |
-|---------|-------|
-| Per API Key Limit | 100 rpm |
-| Per IP Limit | Additional limit. 1000 rpm |
-| Burst Protection | Token Bucket Capacity |
-| Progressive Penalties | Future: Temporary Block, Exponential Backoff |
+- Upstream URL валидируется по allowlist схем (`http`, `https`)
+- Запрещены internal IPs:
+  - `10.0.0.0/8`
+  - `172.16.0.0/12`
+  - `192.168.0.0/16`
+  - `127.0.0.0/8`
+  - `169.254.0.0/16` (link-local)
+  - `0.0.0.0/8`
+- DNS rebinding защита — resolve + проверка IP перед запросом
+- Запрещены loopback и multicast адреса
 
 ---
 
-## 6. Replay Attack Prevention
-
-### JWT Replay
-
-JWT by itself does not protect against replay.
-
-### MVP Protection
-
-Use:
-
-- Short Token Lifetime
-- HTTPS Only
-
-**Recommended duration:** 5–15 minutes
-
-### Future Protection
-
-Use claim:
-
-- `jti`
-
-Store:
-
-- `jwt:jti:{id}` in Redis.
-
-Reuse:
-
-- Reject
-
-### Signature Replay
-
-If HMAC is used:
-
-Check:
-
-- Timestamp
-- Nonce
-
-**Acceptable window:** ±5 minutes
-
----
-
-## 7. Header Injection Protection
-
-### Threats
-
-Examples:
-
-- CRLF Injection
-- Header Smuggling
-- Host Header Attacks
-
-### Protection
-
-**Normalize Headers**
-
-Remove:
-
-- ``
-- `
-`
-
-**Host Validation**
-
-Allowed hosts:
-
-- Allowed Hosts List
-
-**Header Whitelist**
-
-Allowed:
-
-- Authorization
-- Content-Type
-- Accept
-- X-Request-ID
-- X-Correlation-ID
-
-**Strip Dangerous Headers**
-
-Remove:
-
-- X-Original-URL
-- X-Rewrite-URL
-- Forwarded (if coming from client)
-
----
-
-## 8. CORS + CSRF Strategy
-
-### CORS
-
-For React Admin.
-
-**Allowed Origins**
-
-```
-https://admin.company.com
-```
-
-Do not use:
-
-- `*`
-
-**Allowed Methods**
-
-- GET
-- POST
-- PATCH
-- DELETE
-- OPTIONS
-
-**Allowed Headers**
-
-- Authorization
-- Content-Type
-- X-Request-ID
-
-### CSRF
-
-**Admin API**
-
-If using JWT Bearer:
-
-- CSRF is not required
-
-If Cookie Sessions appear:
-
-- CSRF is mandatory
-
----
-
-## 9. Secrets Management Strategy
-
-### Secrets
-
-The following are considered secrets:
-
-- JWT Public Keys
-- JWT Private Keys
-- Database Credentials
-- Redis Credentials
-- Encryption Keys
-- API Secrets
-
-### Storage
-
-**Development:**
-
-- `.env`
-
-**Production:**
-
-- Docker Secrets
-- Vault
-- Cloud Secret Manager
-
-### Rules
-
-**Never:**
-
-- Git
-- Logs
-- Database
-
-### Rotation
-
-**Support:**
-
-- Key Rotation
-- Credential Rotation
-
-without downtime.
-
----
-
-## 10. OWASP Top 10 Mapping
-
-| OWASP | Mitigation |
-|-------|------------|
-| A01 Broken Access Control | JWT + RBAC |
-| A02 Cryptographic Failures | TLS + RS256 |
-| A03 Injection | Validation + ORM |
-| A04 Insecure Design | Threat Modeling |
-| A05 Security Misconfiguration | Hardened Defaults |
-| A06 Vulnerable Components | Dependency Scanning |
-| A07 Authentication Failures | JWT Validation |
-| A08 Software Integrity Failures | Signed Builds |
-| A09 Logging Failures | Structured Logging |
-| A10 SSRF | Upstream Allowlist |
-
----
-
-## Attack Scenarios
-
-### Scenario 1 — Stolen API Key
-
-**Attack**
-
-Attacker obtains API Key
-
-**Mitigation**
-
-- Rate Limiting
-- Revocation
-- Rotation
-- Monitoring
-
-### Scenario 2 — Forged JWT
-
-**Attack**
-
-Modified JWT Payload
-
-**Mitigation**
-
-- Signature Validation
-- Issuer Validation
-- Audience Validation
-
-### Scenario 3 — Route Enumeration
-
-**Attack**
-
-Bruteforce API Paths
-
-**Mitigation**
-
-- Rate Limiting
-- 404 Normalization
-- Monitoring
-
-### Scenario 4 — Redis Exhaustion
-
-**Attack**
-
-Cache Key Explosion
-
-**Mitigation**
-
-- TTL
-- Memory Limits
-- Key Size Limits
-- Eviction Policy
-
-### Scenario 5 — Log Injection
-
-**Attack**
-
-Malicious Characters In Headers
-
-**Mitigation**
-
-- Structured Logging
-- Header Sanitization
-- Escaping
-
-### Scenario 6 — SSRF Through Route Configuration
-
-**Attack**
-
-Administrator or attacker creates a route to:
-
-- `169.254.169.254`
-- `localhost`
-- internal services
-
-**Mitigation**
-
-- Upstream Allowlist
-- CIDR Restrictions
-- Private Network Validation
-- DNS Re-Validation
-
-### Scenario 7 — Upstream DoS Amplification
-
-**Attack**
-
-Large Number Of Expensive Requests
-
-**Mitigation**
-
-- Rate Limiting
-- Caching
-- Circuit Breakers (Future)
-- Timeouts
-
----
-
-## Security Architecture Decisions (SAD)
-
-| ID | Decision |
-|----|----------|
-| SAD-001 | JWT Validation is performed before Route Resolution. |
-| SAD-002 | API Keys are stored only as a hash. |
-| SAD-003 | All requests receive a Request ID. |
-| SAD-004 | Redis failure must not lead to complete Gateway unavailability. |
-| SAD-005 | All security errors are logged as Security Events. |
-| SAD-006 | Gateway trusts only explicitly allowed upstream services. |
-| SAD-007 | CORS operates on an allowlist model. |
-| SAD-008 | All external connections operate only through TLS. |
-| SAD-009 | JWT algorithm `none` is completely forbidden. |
-| SAD-010 | Any authentication passes before the Cache Layer and Reverse Proxy Layer. |
+## 6. Security Logs
+
+- Все auth failures логируются с `security=true` флагом
+- Brute-force паттерны: >5 failed auth/minute с одного IP → алерт
+- Security events:
+  - Invalid API key attempts
+  - Expired JWT usage
+  - Invalid signature attempts
+  - Rate limit bypass attempts
+  - SSRF blocked attempts

@@ -1,94 +1,126 @@
 # Rate Limiting
 
-## Algorithm
+## Algorithm: Token Bucket
 
-Используется **Fixed Window Counter** алгоритм с Redis.
+Выбран **Token Bucket** для поддержки burst-запросов и предсказуемого поведения.
 
-### Fixed Window
+### Bucket Structure
 
-```
-Window: 1 minute
-Key: ratelimit:{client_id}:{route_id}:{timestamp_minute}
+Redis Key: `rl:{client_id}:{route_id}`
 
-Example:
-ratelimit:api_key_123:route_456:202401011200
+Value (Hash):
+```json
+{
+  "tokens": 84,
+  "capacity": 100,
+  "last_refill": 1710000000
+}
 ```
 
 ### Algorithm Steps
 
-1. Определить текущее окно: `floor(current_timestamp / window_size)`
-2. Сформировать Redis key
-3. Выполнить `INCR key`
-4. Если key новый — установить TTL = window_size
-5. Получить текущее значение
-6. Если значение > limit — отклонить запрос (429)
-7. Добавить rate limit headers
+1. Загрузить bucket из Redis: `HGETALL rl:{client_id}:{route_id}`
+2. Вычислить прошедшее время с `last_refill`
+3. Пополнить токены: `tokens = min(capacity, tokens + elapsed * rate)`
+4. Если `tokens >= 1`:
+   - Уменьшить `tokens` на 1
+   - Обновить `last_refill`
+   - Сохранить bucket: `HMSET`
+   - Разрешить запрос
+5. Если `tokens < 1`:
+   - Отклонить запрос (429)
 
-### Redis Commands
+### Redis Atomicity
 
-```redis
-MULTI
-INCR ratelimit:client:route:window
-EXPIRE ratelimit:client:route:window 60
-EXEC
-```
+Для предотвращения race condition используется **Lua script**:
 
-## Redis Keys
+```lua
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
 
-| Pattern | Описание | TTL |
-|---------|----------|-----|
-| `ratelimit:{api_key_id}:{route_id}:{window}` | Счетчик для API Key | 60s |
-| `ratelimit:{jwt_sub}:{route_id}:{window}` | Счетчик для JWT | 60s |
-| `ratelimit:ip:{client_ip}:{route_id}:{window}` | Счетчик по IP (fallback) | 60s |
+local bucket = redis.call('HGETALL', key)
+local tokens, last_refill
 
-## Flow
+if #bucket == 0 then
+    tokens = capacity
+    last_refill = now
+else
+    tokens = tonumber(bucket[2])
+    last_refill = tonumber(bucket[4])
+end
 
-```
-Client -> Gateway: Request
-Gateway -> Rate Limit: Check Limit
-Rate Limit -> Redis: INCR + EXPIRE
-Redis --> Rate Limit: Count
-alt Count <= Limit
-    Rate Limit --> Gateway: ALLOW
-    Gateway -> Upstream: Request
-    Upstream --> Gateway: Response
-    Gateway --> Client: Response + Rate Limit Headers
-else Count > Limit
-    Rate Limit --> Gateway: DENY
-    Gateway --> Client: 429 Too Many Requests
+local elapsed = now - last_refill
+tokens = math.min(capacity, tokens + elapsed * rate)
+
+if tokens >= 1 then
+    tokens = tokens - 1
+    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+    redis.call('EXPIRE', key, 120)
+    return 1
+else
+    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', last_refill)
+    redis.call('EXPIRE', key, 120)
+    return 0
 end
 ```
+
+## Per-Key Limits
+
+| Limit Type | Redis Key Pattern | Default |
+|------------|-------------------|---------|
+| API Key | `rl:{api_key_id}:{route_id}` | 1000/min |
+| JWT User | `rl:{jwt_sub}:{route_id}` | 1000/min |
+| IP Fallback | `rl:ip:{client_ip}:{route_id}` | 100/min |
+
+## Configuration
+
+| Параметр | Значение | Описание |
+|----------|----------|----------|
+| `RATE_LIMIT_CAPACITY` | 100 | Максимум токенов в bucket |
+| `RATE_LIMIT_RATE` | 1000/min | Скорость пополнения токенов |
+| `RATE_LIMIT_REDIS_TIMEOUT` | 0.5s | Таймаут подключения к Redis |
+| `RATE_LIMIT_FAIL_OPEN` | True | Пропускать при недоступности Redis |
 
 ## Error Handling
 
 ### Rate Limit Exceeded
 - Status: 429 Too Many Requests
 - Headers:
-  - `X-RateLimit-Limit`: 1000
-  - `X-RateLimit-Remaining`: 0
-  - `X-RateLimit-Reset`: 1704067260
-  - `Retry-After`: 45
+  ```http
+  X-RateLimit-Limit: 1000
+  X-RateLimit-Remaining: 0
+  X-RateLimit-Reset: 1704067260
+  Retry-After: 45
+  ```
 - Body:
-```json
-{
-  "error": "rate_limit_exceeded",
-  "message": "Rate limit exceeded. Try again in 45 seconds.",
-  "limit": 1000,
-  "window": 60,
-  "reset_at": "2024-01-01T12:01:00Z"
-}
-```
+  ```json
+  {
+    "error": "rate_limit_exceeded",
+    "message": "Rate limit exceeded. Try again in 45 seconds.",
+    "limit": 1000,
+    "window": 60,
+    "reset_at": "2024-01-01T12:01:00Z"
+  }
+  ```
 
 ### Redis Unavailable
-- Если Redis недоступен — пропускаем rate limiting (fail open)
-- Логируем warning
+- Пропускаем rate limiting (fail-open)
+- Логируем warning: `rate_limit_redis_error`
 - Метрика: `rate_limit_redis_error`
+- Gateway продолжает работу
 
-### Configuration
+## Abuse Scenarios
 
-| Параметр | Значение | Описание |
-|----------|----------|----------|
-| `RATE_LIMIT_WINDOW` | 60 | Размер окна в секундах |
-| `RATE_LIMIT_DEFAULT` | 1000 | Лимит по умолчанию |
-| `RATE_LIMIT_REDIS_TIMEOUT` | 0.5 | Таймаут подключения к Redis |
-| `RATE_LIMIT_FAIL_OPEN` | True | Пропускать при недоступности Redis |
+| Сценарий | Защита |
+|----------|--------|
+| Distributed brute force | По `api_key_id` + IP correlation |
+| Key sharing | Уникальный `api_key_id` per client |
+| Bypass через JWT | JWT sub также rate-limited |
+| Redis down | Fail-open + алерт |
+
+## Redis TTL
+
+- Bucket TTL: `2 × refill window` (по умолчанию 120s)
+- Inactive users автоматически очищаются
